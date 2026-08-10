@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 8000,
+  "api_key": "client-key-used-by-your-callers",
+  "upstream_base_url": "http://127.0.0.1:9000",
+  "upstream_api_key": "grok-upstream-key",
+  "imgbb_api_key": "your-imgbb-key",
+  "request_timeout": 120
+}
