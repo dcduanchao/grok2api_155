@@ -3,7 +3,8 @@
 set -u
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+CONDA_ENV="${CONDA_ENV:-/root/miniconda3/envs/grok}"
+PYTHON_BIN="${PYTHON_BIN:-$CONDA_ENV/bin/python}"
 PID_FILE="$APP_DIR/grok2api.pid"
 LOG_FILE="$APP_DIR/grok2api.log"
 
@@ -48,7 +49,11 @@ start() {
     fi
 
     cd "$APP_DIR" || return 1
-    nohup "$PYTHON_BIN" "$APP_DIR/app.py" >> "$LOG_FILE" 2>&1 &
+    nohup env \
+        PATH="$CONDA_ENV/bin:$PATH" \
+        CONDA_PREFIX="$CONDA_ENV" \
+        CONDA_DEFAULT_ENV="$(basename "$CONDA_ENV")" \
+        "$PYTHON_BIN" "$APP_DIR/app.py" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     sleep 1
 

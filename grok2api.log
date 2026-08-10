@@ -1,0 +1,19 @@
+Grok media UI: http://0.0.0.0:11111/
+[10/Aug/2026 10:13:11] 20.210.188.137 "GET / HTTP/1.1" 200 -
+[trace] response method="GET" url="/api/health" status="200" result={"ok": "True", "configured": "True", "time": "1786356792"}
+[10/Aug/2026 10:13:12] 20.210.188.137 "GET /api/health HTTP/1.1" 200 -
+[trace] response method="GET" url="/favicon.ico" status="404" result={"error": {"message": "not found", "type": "not_found"}}
+[10/Aug/2026 10:13:12] 20.210.188.137 "GET /favicon.ico HTTP/1.1" 404 -
+[trace] response method="GET" url="/api/history?limit=100" status="200" result={"data": []}
+[10/Aug/2026 10:13:12] 20.210.188.137 "GET /api/history?limit=100 HTTP/1.1" 200 -
+[trace] request method="POST" url="/v1/images/generations" params={"model": "grok-imagine-image", "prompt": "cat", "n": "1", "aspect_ratio": "1:1", "resolution": "1k", "response_format": "url", "stream": "False"}
+[trace] upstream.request method="POST" url="http://155.94.170.142:8000/v1/images/generations" params={"model": "grok-imagine-image", "prompt": "cat", "n": "1", "aspect_ratio": "1:1", "resolution": "1k", "response_format": "url", "stream": "False"}
+[trace] upstream.response method="POST" url="http://155.94.170.142:8000/v1/images/generations" status="200" result={"data": [{"mime_type": "image/jpeg", "url": "http://155.94.170.142:8000/v1/media/images/img_926gT-Rz-RF_jOIYYeaR4x9Lr8zQLPt4"}]}
+[trace] response method="POST" url="/v1/images/generations" status="200" result={"data": [{"mime_type": "image/jpeg", "url": "http://155.94.170.142:8000/v1/media/images/img_926gT-Rz-RF_jOIYYeaR4x9Lr8zQLPt4"}]}
+[10/Aug/2026 10:13:36] 20.210.188.137 "POST /v1/images/generations HTTP/1.1" 200 -
+[trace] response method="GET" url="/api/history?limit=100" status="200" result={"data": [{"id": "f142c1ab661642bf84960c57a84a15b1", "kind": "image", "url": "http://155.94.170.142:8000/v1/media/images/img_926gT-Rz-RF_jOIYYeaR4x9Lr8zQLPt4", "data_uri": "None", "title": "", "prompt": "cat", "model": "grok-imagine-image", "status": "done", "metadata": {"mime_type": "image/jpeg", "url": "http://155.94.170.142:8000/v1/media/images/img_926gT-Rz-RF_jOIYYeaR4x9Lr8zQLPt4"}, "created_at": "1786356816"}]}
+[10/Aug/2026 10:13:37] 20.210.188.137 "GET /api/history?limit=100 HTTP/1.1" 200 -
+[trace] request method="DELETE" url="/api/history" params={}
+[trace] response method="DELETE" url="/api/history" status="200" result={"deleted": "1", "kind": "all"}
+[10/Aug/2026 10:13:54] 20.210.188.137 "DELETE /api/history HTTP/1.1" 200 -
+[trace] response method="GET" url="/api/history?limit=100" status="200" result={"data": []}
