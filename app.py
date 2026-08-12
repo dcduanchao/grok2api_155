@@ -7,6 +7,7 @@ variables) to connect it to an existing Grok-compatible gateway.
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
 import mimetypes
@@ -20,13 +21,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.getenv("GROK2API_CONFIG", ROOT / "config.json"))
 DB_PATH = Path(os.getenv("GROK2API_DB", ROOT / "data" / "media.db"))
 INDEX_PATH = ROOT / "index.html"
+LOG_PATH = Path(os.getenv("GROK2API_LOG", ROOT / "grok2api.log"))
 DB_LOCK = threading.Lock()
 
 
@@ -39,6 +41,29 @@ def load_config() -> dict:
         "upstream_api_key": "",
         "imgbb_api_key": "",
         "request_timeout": 120,
+        "comfyui_base_url": "http://192.168.90.65:8188",
+        "comfyui_client_id": "grok2api-comfyui",
+        "comfyui_request_timeout": 30,
+        "comfyui_poll_timeout": 1800,
+        "comfyui_workflows": {
+            "text_to_image": "workflows/z_image_turbo_16.json",
+            "image_edit": "workflows/qwen_edit_all.json",
+        },
+        "comfyui_workflow_mapping": {
+            "text_to_image": {
+                "positive_prompt": {"node_id": "2", "input": "text"},
+                "negative_prompt": {"node_id": "12", "input": "text"},
+                "seed": {"node_id": "17", "input": "seed"},
+                "width": {"node_id": "14", "input": "width"},
+                "height": {"node_id": "14", "input": "height"},
+            },
+            "image_edit": {
+                "positive_prompt": {"node_id": "18", "input": "prompt"},
+                "negative_prompt": {"node_id": "5", "input": "text"},
+                "input_image": {"node_id": "14", "input": "image"},
+                "seed": {"node_id": "19", "input": "seed"},
+            },
+        },
     }
     try:
         values = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -80,7 +105,13 @@ def _log_value(value: object, key: str = "") -> object:
 
 def trace(label: str, **fields: object) -> None:
     details = " ".join(f"{name}={json.dumps(_log_value(value, name), ensure_ascii=False)}" for name, value in fields.items())
-    print(f"[trace] {label} {details}".rstrip(), flush=True)
+    line = f"[trace] {label} {details}".rstrip()
+    print(line, flush=True)
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as log:
+            log.write(line + "\n")
+    except OSError:
+        pass
 
 
 def upstream_auth_header() -> str | None:
@@ -279,6 +310,155 @@ def persist_generation(response: dict, kind: str, payload: dict, request_id: str
         save_media(kind, url=url, prompt=str(payload.get("prompt", "")), model=str(payload.get("model", "")), metadata=response)
 
 
+def comfyui_base_url() -> str:
+    return str(CONFIG.get("comfyui_base_url", "")).strip().rstrip("/")
+
+
+def comfyui_error(message: str, error_type: str = "upstream_error") -> dict:
+    return {"error": {"message": message, "type": error_type}}
+
+
+def comfyui_request(method: str, path: str, payload: object | None = None) -> tuple[int, object]:
+    base = comfyui_base_url()
+    if not base:
+        return 503, comfyui_error("comfyui_base_url is not configured in config.json", "configuration_error")
+    target = urljoin(base + "/", path.lstrip("/"))
+    headers = {"Accept": "application/json"}
+    body = None
+    if payload is not None:
+        body = json_bytes(payload)
+        headers["Content-Type"] = "application/json"
+    trace("comfyui.request", method=method, url=target, params=payload or {})
+    try:
+        with urlopen(Request(target, data=body, headers=headers, method=method), timeout=float(CONFIG.get("comfyui_request_timeout", 30))) as response:
+            raw = response.read()
+            try:
+                result = json.loads(raw.decode("utf-8")) if raw else {}
+            except json.JSONDecodeError:
+                result = {"raw": raw.decode("utf-8", "replace")}
+            trace("comfyui.response", method=method, url=target, status=response.status, result=result)
+            return response.status, result
+    except HTTPError as exc:
+        raw = exc.read()
+        try:
+            result = json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError:
+            result = comfyui_error(raw.decode("utf-8", "replace") or str(exc))
+        trace("comfyui.response", method=method, url=target, status=exc.code, result=result)
+        return exc.code, result
+    except (URLError, TimeoutError, OSError) as exc:
+        result = comfyui_error(f"ComfyUI request failed: {exc}")
+        trace("comfyui.response", method=method, url=target, status=502, result=result)
+        return 502, result
+
+
+def comfyui_upload_image(image: bytes, filename: str) -> tuple[int, object]:
+    base = comfyui_base_url()
+    if not base:
+        return 503, comfyui_error("comfyui_base_url is not configured in config.json", "configuration_error")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "upload.png").strip("._") or "upload.png"
+    content_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    boundary = "----grok2api-" + uuid.uuid4().hex
+    fields = [
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image"; filename="{safe_name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8"),
+        image,
+        f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\ntrue\r\n--{boundary}--\r\n".encode("utf-8"),
+    ]
+    body = b"".join(fields)
+    target = urljoin(base + "/", "upload/image")
+    trace(
+        "comfyui.upload.request",
+        method="POST",
+        url=target,
+        params={
+            "image": {"filename": safe_name, "content_type": content_type, "bytes": len(image)},
+            "overwrite": True,
+        },
+    )
+    try:
+        with urlopen(Request(target, data=body, headers={"Content-Type": "multipart/form-data; boundary=" + boundary, "Accept": "application/json"}, method="POST"), timeout=float(CONFIG.get("comfyui_request_timeout", 30))) as response:
+            raw = response.read()
+            try:
+                result = json.loads(raw.decode("utf-8")) if raw else {}
+            except json.JSONDecodeError:
+                result = {"name": safe_name, "raw": raw.decode("utf-8", "replace")}
+            trace("comfyui.upload.response", method="POST", url=target, status=response.status, result=result)
+            return response.status, result if isinstance(result, dict) else {"data": result}
+    except HTTPError as exc:
+        raw = exc.read()
+        try:
+            result = json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError:
+            result = comfyui_error(raw.decode("utf-8", "replace") or str(exc))
+        trace("comfyui.upload.response", method="POST", url=target, status=exc.code, result=result)
+        return exc.code, result
+    except (URLError, TimeoutError, OSError) as exc:
+        result = comfyui_error(f"ComfyUI upload failed: {exc}")
+        trace("comfyui.upload.response", method="POST", url=target, status=502, result=result)
+        return 502, result
+
+
+def comfyui_workflow_config(workflow_name: str) -> tuple[dict | None, dict | None]:
+    workflows = CONFIG.get("comfyui_workflows") or {}
+    mapping = CONFIG.get("comfyui_workflow_mapping") or {}
+    relative_path = workflows.get(workflow_name)
+    if not relative_path:
+        return None, comfyui_error(f"unknown ComfyUI workflow: {workflow_name}", "invalid_request")
+    workflow_path = (ROOT / str(relative_path)).resolve()
+    try:
+        workflow_path.relative_to(ROOT)
+    except ValueError:
+        return None, comfyui_error("ComfyUI workflow path must stay inside the project", "configuration_error")
+    try:
+        workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, comfyui_error(f"workflow file not found: {relative_path}", "configuration_error")
+    except json.JSONDecodeError as exc:
+        return None, comfyui_error(f"workflow JSON is invalid: {exc}", "configuration_error")
+    if not isinstance(workflow, dict) or not workflow:
+        return None, comfyui_error("workflow JSON must be a non-empty object", "configuration_error")
+    return {"prompt": workflow, "mapping": mapping.get(workflow_name) or {}}, None
+
+
+def comfyui_set_input(prompt: dict, mapping: dict, name: str, value: object) -> None:
+    spec = mapping.get(name)
+    if not isinstance(spec, dict) or value is None:
+        return
+    node_id = str(spec.get("node_id", ""))
+    input_name = str(spec.get("input", ""))
+    if node_id in prompt and input_name:
+        inputs = prompt[node_id].setdefault("inputs", {})
+        inputs[input_name] = value
+
+
+def comfyui_outputs(history: object, prompt_id: str) -> list[dict]:
+    record = history.get(prompt_id) if isinstance(history, dict) else None
+    if not isinstance(record, dict):
+        return []
+    outputs = record.get("outputs") or {}
+    result = []
+    if not isinstance(outputs, dict):
+        return result
+    for node_id, node_output in outputs.items():
+        if not isinstance(node_output, dict):
+            continue
+        for media_type, output_type in (("images", "image"), ("videos", "video"), ("gifs", "video")):
+            for item in node_output.get(media_type) or []:
+                if isinstance(item, dict) and item.get("filename"):
+                    result.append({
+                        "type": output_type,
+                        "filename": str(item.get("filename")),
+                        "subfolder": str(item.get("subfolder") or ""),
+                        "comfy_type": str(item.get("type") or "output"),
+                        "node_id": str(node_id),
+                    })
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "GrokMedia/1.0"
 
@@ -335,6 +515,109 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self.send_json({"ok": True, "configured": bool(CONFIG.get("upstream_base_url")), "time": int(time.time())})
+            return
+        if path == "/api/comfyui/health":
+            status, result = comfyui_request("GET", "/system_stats")
+            if status >= 400:
+                self.send_json(result, status)
+                return
+            queue_status, queue = comfyui_request("GET", "/queue")
+            running = len(queue.get("queue_running", [])) if isinstance(queue, dict) else None
+            pending = len(queue.get("queue_pending", [])) if isinstance(queue, dict) else None
+            self.send_json({"ok": True, "base_url": comfyui_base_url(), "queue_running": running, "queue_pending": pending, "system": result})
+            return
+        if path == "/api/comfyui/workflows":
+            workflows = CONFIG.get("comfyui_workflows") or {}
+            data = []
+            for name, relative_path in workflows.items():
+                workflow_path = (ROOT / str(relative_path)).resolve()
+                available = False
+                error = ""
+                try:
+                    workflow_path.relative_to(ROOT)
+                    json.loads(workflow_path.read_text(encoding="utf-8"))
+                    available = True
+                except FileNotFoundError:
+                    error = "workflow file not found"
+                except (ValueError, json.JSONDecodeError) as exc:
+                    error = str(exc)
+                data.append({"name": name, "display_name": {"text_to_image": "文生图", "image_edit": "图片编辑"}.get(name, name), "available": available, "error": error})
+            self.send_json({"data": data, "base_url": comfyui_base_url()})
+            return
+        if path.startswith("/api/comfyui/tasks/") and path.count("/") == 4:
+            task_id = path.rsplit("/", 1)[-1]
+            row = get_media(task_id)
+            if not row or row.get("metadata", {}).get("source") != "comfyui":
+                self.send_error_json(404, "ComfyUI task not found", "not_found")
+                return
+            metadata = row.get("metadata") or {}
+            prompt_id = str(metadata.get("prompt_id") or "")
+            status, history = comfyui_request("GET", "/history/" + quote(prompt_id, safe="")) if prompt_id else (400, {})
+            if status < 400:
+                outputs = comfyui_outputs(history, prompt_id)
+                if outputs:
+                    output_items = []
+                    for index, output in enumerate(outputs):
+                        if index == 0:
+                            media_id = task_id
+                            media_url = "/api/comfyui/media/" + media_id
+                            update_media(media_id, url=media_url, model="ComfyUI · " + str(metadata.get("workflow", "")), metadata={**metadata, **output})
+                        else:
+                            media = save_media("image", prompt=row.get("prompt", ""), model="ComfyUI · " + str(metadata.get("workflow", "")), metadata={**metadata, **output})
+                            media_id = media["id"]
+                            media_url = "/api/comfyui/media/" + media_id
+                            update_media(media_id, url=media_url)
+                        output_items.append({**output, "media_id": media_id, "url": media_url})
+                    metadata["outputs"] = output_items
+                    update_media(task_id, status="done", metadata=metadata)
+                    self.send_json({"task_id": task_id, "prompt_id": prompt_id, "workflow": metadata.get("workflow"), "status": "done", "progress": 100, "outputs": output_items})
+                    return
+                status_info = history.get(prompt_id) if isinstance(history, dict) else None
+                if isinstance(status_info, dict) and status_info.get("status", {}).get("status_str") == "error":
+                    metadata["error"] = status_info.get("status")
+                    update_media(task_id, status="failed", metadata=metadata)
+                    self.send_json({"task_id": task_id, "prompt_id": prompt_id, "status": "failed", "progress": 0, "error": metadata["error"]})
+                    return
+            self.send_json({"task_id": task_id, "prompt_id": prompt_id, "workflow": metadata.get("workflow"), "status": row.get("status") or "pending", "progress": 0})
+            return
+        if path.startswith("/api/comfyui/media/") and path.count("/") == 4:
+            media_id = path.rsplit("/", 1)[-1]
+            item = get_media(media_id)
+            metadata = item.get("metadata", {}) if item else {}
+            if metadata.get("source") == "comfyui" and not metadata.get("filename"):
+                for output in metadata.get("outputs") or []:
+                    if isinstance(output, dict) and str(output.get("media_id")) == media_id:
+                        metadata = {**metadata, **output}
+                        break
+            if not item or metadata.get("source") != "comfyui" or not metadata.get("filename"):
+                self.send_error_json(404, "ComfyUI media not found", "not_found")
+                return
+            query = urlencode({"filename": metadata["filename"], "subfolder": metadata.get("subfolder", ""), "type": metadata.get("comfy_type", "output")})
+            target = urljoin(comfyui_base_url() + "/", "view?" + query)
+            trace(
+                "comfyui.media.request",
+                method="GET",
+                url=target,
+                params={
+                    "filename": metadata["filename"],
+                    "subfolder": metadata.get("subfolder", ""),
+                    "type": metadata.get("comfy_type", "output"),
+                },
+            )
+            try:
+                with urlopen(Request(target, headers={"Accept": "image/*,video/*,*/*"}, method="GET"), timeout=float(CONFIG.get("comfyui_request_timeout", 30))) as upstream:
+                    self.send_response(upstream.status)
+                    self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/octet-stream"))
+                    if upstream.headers.get("Content-Length"):
+                        self.send_header("Content-Length", upstream.headers["Content-Length"])
+                    self.end_headers()
+                    while True:
+                        chunk = upstream.read(256 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                self.send_error_json(502, f"ComfyUI media fetch failed: {exc}", "upstream_error")
             return
         if path in {"/v1/media/history", "/api/history"}:
             query = parse_qs(parsed.query)
@@ -447,6 +730,94 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/v1/") and not self.authorized():
             self.send_error_json(401, "invalid API key", "authentication_error")
             return
+        if path == "/api/comfyui/generations":
+            try:
+                payload = self.read_json()
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_error_json(400, str(exc))
+                return
+            workflow_name = str(payload.get("workflow") or "text_to_image").strip()
+            prompt_text = str(payload.get("prompt") or "").strip()
+            if workflow_name not in {"text_to_image", "image_edit"}:
+                self.send_error_json(400, "workflow must be text_to_image or image_edit", "invalid_request")
+                return
+            if not prompt_text:
+                self.send_error_json(400, "prompt is required", "invalid_request")
+                return
+            workflow_config, error = comfyui_workflow_config(workflow_name)
+            if error:
+                self.send_json(error, 503 if error["error"]["type"] == "configuration_error" else 400)
+                return
+            prompt_graph = copy.deepcopy(workflow_config["prompt"])
+            mapping = workflow_config["mapping"]
+            comfyui_set_input(prompt_graph, mapping, "positive_prompt", prompt_text)
+            comfyui_set_input(prompt_graph, mapping, "negative_prompt", str(payload.get("negative_prompt") or ""))
+            uploaded_image_name = ""
+            if workflow_name == "image_edit":
+                image_payload = payload.get("image")
+                if not isinstance(image_payload, dict):
+                    self.send_error_json(400, "image is required for image_edit", "invalid_request")
+                    return
+                try:
+                    image, filename = self.parse_image_payload(image_payload)
+                except ValueError as exc:
+                    self.send_error_json(400, str(exc), "invalid_request")
+                    return
+                status, upload_result = comfyui_upload_image(image, filename)
+                if status >= 400 or not isinstance(upload_result, dict):
+                    self.send_json(upload_result, status if status >= 400 else 502)
+                    return
+                uploaded_image_name = str(upload_result.get("name") or upload_result.get("filename") or filename)
+                comfyui_set_input(prompt_graph, mapping, "input_image", uploaded_image_name)
+            if payload.get("seed") is not None:
+                try:
+                    seed = int(payload["seed"])
+                except (TypeError, ValueError):
+                    self.send_error_json(400, "seed must be an integer", "invalid_request")
+                    return
+                comfyui_set_input(prompt_graph, mapping, "seed", seed)
+            for field in ("width", "height"):
+                if payload.get(field) is not None:
+                    try:
+                        value = int(payload[field])
+                    except (TypeError, ValueError):
+                        self.send_error_json(400, f"{field} must be an integer", "invalid_request")
+                        return
+                    if value <= 0 or value > 8192:
+                        self.send_error_json(400, f"{field} must be between 1 and 8192", "invalid_request")
+                        return
+                    comfyui_set_input(prompt_graph, mapping, field, value)
+            request = {"prompt": prompt_graph, "client_id": str(CONFIG.get("comfyui_client_id") or "grok2api-comfyui")}
+            trace(
+                "comfyui.prompt.resolved",
+                workflow=workflow_name,
+                url=urljoin(comfyui_base_url() + "/", "prompt"),
+                replacements={
+                    "positive_prompt": prompt_text,
+                    "negative_prompt": str(payload.get("negative_prompt") or ""),
+                    "seed": payload.get("seed"),
+                    "width": payload.get("width"),
+                    "height": payload.get("height"),
+                    "input_image": uploaded_image_name,
+                },
+                request=request,
+            )
+            status, result = comfyui_request("POST", "/prompt", request)
+            if status >= 400 or not isinstance(result, dict) or not result.get("prompt_id"):
+                self.send_json(result, status if status >= 400 else 502)
+                return
+            task_id = uuid.uuid4().hex
+            metadata = {
+                "source": "comfyui",
+                "workflow": workflow_name,
+                "prompt_id": str(result["prompt_id"]),
+                "comfyui_base_url": comfyui_base_url(),
+                "request": {"prompt": prompt_text, "negative_prompt": str(payload.get("negative_prompt") or ""), "seed": payload.get("seed"), "width": payload.get("width"), "height": payload.get("height"), "input_image": uploaded_image_name},
+            }
+            model_name = "ComfyUI · 图片编辑" if workflow_name == "image_edit" else "ComfyUI · 文生图"
+            save_media("image", status="pending", prompt=prompt_text, model=model_name, metadata=metadata, media_id=task_id)
+            self.send_json({"task_id": task_id, "prompt_id": str(result["prompt_id"]), "workflow": workflow_name, "status": "pending"})
+            return
         if path == "/v1/media/uploads" or path == "/api/upload":
             self.handle_upload()
             return
@@ -555,6 +926,31 @@ class Handler(BaseHTTPRequestHandler):
             if content:
                 return content, (filename_match.group(1).decode("utf-8", "ignore") if filename_match else "upload")
         raise ValueError("multipart field image is required")
+
+    def parse_image_payload(self, image_payload: dict) -> tuple[bytes, str]:
+        source = str(image_payload.get("data") or image_payload.get("b64_json") or "").strip()
+        filename = str(image_payload.get("name") or "comfyui-edit.png").strip() or "comfyui-edit.png"
+        if source:
+            try:
+                return base64.b64decode(source.split(",", 1)[-1]), filename
+            except Exception as exc:
+                raise ValueError(f"image data is invalid: {exc}") from exc
+        url = str(image_payload.get("url") or "").strip()
+        if not url:
+            raise ValueError("image.data or image.url is required")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("image.url must be http or https")
+        try:
+            with urlopen(Request(url, headers={"Accept": "image/*,*/*"}, method="GET"), timeout=float(CONFIG.get("request_timeout", 120))) as response:
+                content = response.read(32 * 1024 * 1024 + 1)
+                if len(content) > 32 * 1024 * 1024:
+                    raise ValueError("image is larger than 32 MB")
+                return content, Path(parsed.path).name or filename
+        except ValueError:
+            raise
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise ValueError(f"image.url fetch failed: {exc}") from exc
 
 
 def main() -> None:

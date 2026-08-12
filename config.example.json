@@ -5,5 +5,28 @@
   "upstream_base_url": "http://127.0.0.1:9000",
   "upstream_api_key": "grok-upstream-key",
   "imgbb_api_key": "your-imgbb-key",
-  "request_timeout": 120
+  "request_timeout": 120,
+  "comfyui_base_url": "http://192.168.90.65:8188",
+  "comfyui_client_id": "grok2api-comfyui",
+  "comfyui_request_timeout": 30,
+  "comfyui_poll_timeout": 1800,
+  "comfyui_workflows": {
+    "text_to_image": "workflows/z_image_turbo_16.json",
+    "image_edit": "workflows/qwen_edit_all.json"
+  },
+  "comfyui_workflow_mapping": {
+    "text_to_image": {
+      "positive_prompt": {"node_id": "2", "input": "text"},
+      "negative_prompt": {"node_id": "12", "input": "text"},
+      "seed": {"node_id": "17", "input": "seed"},
+      "width": {"node_id": "14", "input": "width"},
+      "height": {"node_id": "14", "input": "height"}
+    },
+    "image_edit": {
+      "positive_prompt": {"node_id": "18", "input": "prompt"},
+      "negative_prompt": {"node_id": "5", "input": "text"},
+      "input_image": {"node_id": "14", "input": "image"},
+      "seed": {"node_id": "19", "input": "seed"}
+    }
+  }
 }
