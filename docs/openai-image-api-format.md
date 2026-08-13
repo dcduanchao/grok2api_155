@@ -44,7 +44,7 @@ Authorization: Bearer $OPENAI_API_KEY
 - `mask`：可选遮罩图片
 - `n`、`size`、`quality`、`output_format`：可选输出参数
 
-本项目的通用页先支持单张图片 URL 或上传图片，服务端会下载 URL 后以 multipart 形式转发。
+本项目通用页支持本地图片或图片 URL。本地图片由浏览器读取为 Base64 并传给本项目后端；后端将 Base64 解码为图片二进制，再以 multipart 形式转发。图片 URL 则由后端下载后以相同方式转发。
 
 ## 返回格式
 

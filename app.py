@@ -374,13 +374,14 @@ def image_provider_request(provider: dict, path: str, payload: dict, image: byte
         headers["Content-Type"] = "application/json"
     else:
         boundary = "----grok2api-image-" + uuid.uuid4().hex
-        parts = [
+        parts = []
+        for key_name, value in payload.items():
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key_name}\"\r\n\r\n{value}\r\n".encode())
+        parts.extend([
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"{filename}\"\r\nContent-Type: {mimetypes.guess_type(filename)[0] or 'image/png'}\r\n\r\n".encode(),
             image,
             f"\r\n--{boundary}--\r\n".encode(),
-        ]
-        for key_name, value in payload.items():
-            parts.insert(-1, f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key_name}\"\r\n\r\n{value}\r\n".encode())
+        ])
         body = b"".join(parts)
         headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
     trace("image_provider.request", method="POST", url=target, provider=provider.get("name"), params=payload)
@@ -1138,6 +1139,11 @@ class Handler(BaseHTTPRequestHandler):
         url = str(image_payload.get("url") or "").strip()
         if not url:
             raise ValueError("image.data or image.url is required")
+        if url.startswith("data:"):
+            try:
+                return base64.b64decode(url.split(",", 1)[-1]), filename
+            except Exception as exc:
+                raise ValueError(f"image data is invalid: {exc}") from exc
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             raise ValueError("image.url must be http or https")
