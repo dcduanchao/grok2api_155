@@ -33,7 +33,6 @@ CONFIG_PATH = Path(os.getenv("GROK2API_CONFIG", ROOT / "config.json"))
 DB_PATH = Path(os.getenv("GROK2API_DB", ROOT / "data" / "media.db"))
 INDEX_PATH = ROOT / "index.html"
 LOGIN_PATH = ROOT / "login.html"
-LOG_PATH = Path(os.getenv("GROK2API_LOG", ROOT / "grok2api.log"))
 DB_LOCK = threading.Lock()
 SESSION_LOCK = threading.Lock()
 SESSIONS: dict[str, float] = {}
@@ -130,11 +129,6 @@ def trace(label: str, **fields: object) -> None:
     details = " ".join(f"{name}={json.dumps(_log_value(value, name), ensure_ascii=False)}" for name, value in fields.items())
     line = f"[trace] {label} {details}".rstrip()
     print(line, flush=True)
-    try:
-        with LOG_PATH.open("a", encoding="utf-8") as log:
-            log.write(line + "\n")
-    except OSError:
-        pass
 
 
 def upstream_auth_header() -> str | None:
