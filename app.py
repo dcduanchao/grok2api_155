@@ -128,6 +128,14 @@ def init_db() -> None:
                 status TEXT, metadata TEXT, created_at INTEGER NOT NULL
             )"""
         )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS image_providers (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '', models TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )"""
+        )
         db.commit()
 
 
@@ -227,6 +235,68 @@ def list_media(kind: str | None = None, limit: int = 100) -> list[dict]:
     return result
 
 
+def list_image_providers() -> list[dict]:
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT id,name,base_url,models,enabled,created_at,updated_at FROM image_providers ORDER BY name").fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["models"] = json.loads(item.pop("models") or "[]")
+        item["enabled"] = bool(item["enabled"])
+        result.append(item)
+    return result
+
+
+def save_image_provider(payload: dict) -> dict:
+    provider_id = str(payload.get("id") or uuid.uuid4().hex)
+    name = str(payload.get("name") or "").strip()
+    base_url = str(payload.get("base_url") or "").strip().rstrip("/")
+    if base_url.lower().endswith("/v1"):
+        base_url = base_url[:-3].rstrip("/")
+    api_key = str(payload.get("api_key") or "").strip()
+    models = payload.get("models") or []
+    if not name or not base_url:
+        raise ValueError("name and base_url are required")
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must be an http or https URL")
+    if not isinstance(models, list):
+        raise ValueError("models must be an array")
+    models = [str(model).strip() for model in models if str(model).strip()]
+    now = int(time.time())
+    with DB_LOCK, sqlite3.connect(DB_PATH) as db:
+        existing = db.execute("SELECT api_key,created_at FROM image_providers WHERE id=?", (provider_id,)).fetchone()
+        if not api_key and existing:
+            api_key = existing[0]
+        created_at = existing[1] if existing else now
+        db.execute(
+            "INSERT OR REPLACE INTO image_providers(id,name,base_url,api_key,models,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (provider_id, name, base_url, api_key, json.dumps(models), int(bool(payload.get("enabled", True))), created_at, now),
+        )
+        db.commit()
+    return {"id": provider_id, "name": name, "base_url": base_url, "models": models, "enabled": bool(payload.get("enabled", True)), "created_at": created_at, "updated_at": now}
+
+
+def get_image_provider(provider_id: str) -> dict | None:
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM image_providers WHERE id=?", (provider_id,)).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["models"] = json.loads(item.get("models") or "[]")
+    item["enabled"] = bool(item["enabled"])
+    return item
+
+
+def delete_image_provider(provider_id: str) -> bool:
+    with DB_LOCK, sqlite3.connect(DB_PATH) as db:
+        cursor = db.execute("DELETE FROM image_providers WHERE id=?", (provider_id,))
+        db.commit()
+        return cursor.rowcount > 0
+
+
 def json_bytes(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False).encode("utf-8")
 
@@ -289,6 +359,53 @@ def extract_url(value: object) -> str | None:
             if found:
                 return found
     return None
+
+
+def image_provider_request(provider: dict, path: str, payload: dict, image: bytes | None = None, filename: str = "image.png") -> tuple[int, dict]:
+    base = str(provider.get("base_url") or "").rstrip("/")
+    target = urljoin(base + "/", path.lstrip("/"))
+    headers = {"Accept": "application/json"}
+    key = str(provider.get("api_key") or "").strip()
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    body = None
+    if image is None:
+        body = json_bytes(payload)
+        headers["Content-Type"] = "application/json"
+    else:
+        boundary = "----grok2api-image-" + uuid.uuid4().hex
+        parts = [
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"{filename}\"\r\nContent-Type: {mimetypes.guess_type(filename)[0] or 'image/png'}\r\n\r\n".encode(),
+            image,
+            f"\r\n--{boundary}--\r\n".encode(),
+        ]
+        for key_name, value in payload.items():
+            parts.insert(-1, f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key_name}\"\r\n\r\n{value}\r\n".encode())
+        body = b"".join(parts)
+        headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
+    trace("image_provider.request", method="POST", url=target, provider=provider.get("name"), params=payload)
+    try:
+        with urlopen(Request(target, data=body, headers=headers, method="POST"), timeout=float(CONFIG.get("request_timeout", 120))) as response:
+            raw = response.read()
+            try:
+                result = json.loads(raw.decode("utf-8")) if raw else {}
+            except json.JSONDecodeError:
+                result = {"raw": raw.decode("utf-8", "replace")}
+            result = result if isinstance(result, dict) else {"data": result}
+            trace("image_provider.response", method="POST", url=target, provider=provider.get("name"), status=response.status, result=result)
+            return response.status, result
+    except HTTPError as exc:
+        raw = exc.read()
+        try:
+            result = json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError:
+            result = {"error": {"message": raw.decode("utf-8", "replace") or str(exc)}}
+        trace("image_provider.response", method="POST", url=target, provider=provider.get("name"), status=exc.code, result=result)
+        return exc.code, result
+    except (URLError, TimeoutError, OSError) as exc:
+        result = {"error": {"message": f"image provider request failed: {exc}", "type": "upstream_error"}}
+        trace("image_provider.response", method="POST", url=target, provider=provider.get("name"), status=502, result=result)
+        return 502, result
 
 
 def persist_generation(response: dict, kind: str, payload: dict, request_id: str | None = None) -> None:
@@ -561,6 +678,10 @@ class Handler(BaseHTTPRequestHandler):
             pending = len(queue.get("queue_pending", [])) if isinstance(queue, dict) else None
             self.send_json({"ok": True, "base_url": comfyui_base_url(), "queue_running": running, "queue_pending": pending, "system": result})
             return
+        if path == "/api/images/providers":
+            providers = list_image_providers()
+            self.send_json({"data": providers})
+            return
         if path == "/api/comfyui/workflows":
             workflows = CONFIG.get("comfyui_workflows") or {}
             data = []
@@ -767,6 +888,54 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/comfyui/restart":
             status, result = comfyui_restart()
+            self.send_json(result, status)
+            return
+        if path == "/api/images/providers":
+            try:
+                provider = save_image_provider(self.read_json())
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_error_json(400, str(exc), "invalid_request")
+                return
+            self.send_json(provider)
+            return
+        if path.startswith("/api/images/providers/") and path.count("/") == 4:
+            provider_id = path.rsplit("/", 1)[-1]
+            if not delete_image_provider(provider_id):
+                self.send_error_json(404, "image provider not found", "not_found")
+                return
+            self.send_json({"deleted": provider_id})
+            return
+        if path in {"/api/images/generations", "/api/images/edits"}:
+            try:
+                payload = self.read_json()
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_error_json(400, str(exc), "invalid_request")
+                return
+            provider_id = str(payload.pop("provider_id", "")).strip()
+            provider = get_image_provider(provider_id)
+            if not provider or not provider.get("enabled"):
+                self.send_error_json(400, "enabled image provider is required", "invalid_request")
+                return
+            model = str(payload.get("model") or "").strip()
+            prompt = str(payload.get("prompt") or "").strip()
+            if not model or not prompt:
+                self.send_error_json(400, "model and prompt are required", "invalid_request")
+                return
+            image = None
+            filename = "image.png"
+            if path.endswith("/edits"):
+                image_payload = payload.pop("image", None)
+                if not isinstance(image_payload, dict):
+                    self.send_error_json(400, "image is required for edits", "invalid_request")
+                    return
+                try:
+                    image, filename = self.parse_image_payload(image_payload)
+                except ValueError as exc:
+                    self.send_error_json(400, str(exc), "invalid_request")
+                    return
+            status, result = image_provider_request(provider, "/v1/images/edits" if image is not None else "/v1/images/generations", payload, image, filename)
+            if status < 400:
+                persist_generation(result, "image", payload)
             self.send_json(result, status)
             return
         if path == "/api/comfyui/generations":

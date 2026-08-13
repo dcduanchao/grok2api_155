@@ -4,3 +4,4 @@ data/*.db
 data/*.db-*
 config.json
 docs/**
+!docs/openai-image-api-format.md
