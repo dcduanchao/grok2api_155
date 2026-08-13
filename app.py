@@ -49,6 +49,8 @@ def load_config() -> dict:
         "comfyui_workflows": {
             "text_to_image": "workflows/z_image_turbo_16.json",
             "image_edit": "workflows/qwen_edit_all.json",
+            "text_to_video": "workflows/video_minimax_h3_t2v.json",
+            "image_to_video": "workflows/video_minimax_h3_i2v.json",
         },
         "comfyui_workflow_mapping": {
             "text_to_image": {
@@ -61,6 +63,19 @@ def load_config() -> dict:
                 "positive_prompt": {"node_id": "18", "input": "prompt"},
                 "negative_prompt": {"node_id": "5", "input": "text"},
                 "input_image": {"node_id": "14", "input": "image"},
+            },
+            "text_to_video": {
+                "positive_prompt": {"node_id": "131", "input": "prompt"},
+                "aspect_ratio": {"node_id": "115", "input": "aspect_ratio"},
+                "megapixels": {"node_id": "115", "input": "megapixels"},
+                "duration": {"node_id": "133", "input": "value"},
+            },
+            "image_to_video": {
+                "positive_prompt": {"node_id": "133", "input": "prompt"},
+                "input_image": {"node_id": "114", "input": "image"},
+                "aspect_ratio": {"node_id": "115", "input": "aspect_ratio"},
+                "megapixels": {"node_id": "115", "input": "megapixels"},
+                "duration": {"node_id": "135", "input": "value"},
             },
         },
     }
@@ -167,7 +182,7 @@ def save_media(kind: str, *, url: str | None = None, data_uri: str | None = None
 
 def update_media(media_id: str, **changes) -> dict | None:
     with DB_LOCK, sqlite3.connect(DB_PATH) as db:
-        columns = [k for k in changes if k in {"url", "data_uri", "status", "metadata", "title", "prompt", "model"}]
+        columns = [k for k in changes if k in {"kind", "url", "data_uri", "status", "metadata", "title", "prompt", "model"}]
         if not columns:
             return get_media(media_id)
         values = [json.dumps(changes[k]) if k == "metadata" else changes[k] for k in columns]
@@ -602,9 +617,12 @@ def comfyui_outputs(history: object, prompt_id: str) -> list[dict]:
         for media_type, output_type in (("images", "image"), ("videos", "video"), ("gifs", "video")):
             for item in node_output.get(media_type) or []:
                 if isinstance(item, dict) and item.get("filename"):
+                    filename = str(item.get("filename"))
+                    extension = Path(filename).suffix.lower()
+                    resolved_type = "video" if extension in {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"} else output_type
                     result.append({
-                        "type": output_type,
-                        "filename": str(item.get("filename")),
+                        "type": resolved_type,
+                        "filename": filename,
                         "subfolder": str(item.get("subfolder") or ""),
                         "comfy_type": str(item.get("type") or "output"),
                         "node_id": str(node_id),
@@ -718,9 +736,9 @@ class Handler(BaseHTTPRequestHandler):
                         if index == 0:
                             media_id = task_id
                             media_url = "/api/comfyui/media/" + media_id
-                            update_media(media_id, url=media_url, model="ComfyUI · " + str(metadata.get("workflow", "")), metadata={**metadata, **output})
+                            update_media(media_id, kind=output["type"], url=media_url, model="ComfyUI · " + str(metadata.get("workflow", "")), metadata={**metadata, **output})
                         else:
-                            media = save_media("image", prompt=row.get("prompt", ""), model="ComfyUI · " + str(metadata.get("workflow", "")), metadata={**metadata, **output})
+                            media = save_media(output["type"], prompt=row.get("prompt", ""), model="ComfyUI · " + str(metadata.get("workflow", "")), metadata={**metadata, **output})
                             media_id = media["id"]
                             media_url = "/api/comfyui/media/" + media_id
                             update_media(media_id, url=media_url)
@@ -749,6 +767,9 @@ class Handler(BaseHTTPRequestHandler):
             if not item or metadata.get("source") != "comfyui" or not metadata.get("filename"):
                 self.send_error_json(404, "ComfyUI media not found", "not_found")
                 return
+            extension = Path(str(metadata["filename"])).suffix.lower()
+            if extension in {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"} and item.get("kind") != "video":
+                update_media(media_id, kind="video")
             query = urlencode({"filename": metadata["filename"], "subfolder": metadata.get("subfolder", ""), "type": metadata.get("comfy_type", "output")})
             target = urljoin(comfyui_base_url() + "/", "view?" + query)
             trace(
@@ -762,11 +783,17 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             try:
-                with urlopen(Request(target, headers={"Accept": "image/*,video/*,*/*"}, method="GET"), timeout=float(CONFIG.get("comfyui_request_timeout", 30))) as upstream:
+                headers = {"Accept": "image/*,video/*,*/*"}
+                if self.headers.get("Range"):
+                    headers["Range"] = self.headers["Range"]
+                with urlopen(Request(target, headers=headers, method="GET"), timeout=float(CONFIG.get("comfyui_request_timeout", 30))) as upstream:
                     self.send_response(upstream.status)
                     self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/octet-stream"))
                     if upstream.headers.get("Content-Length"):
                         self.send_header("Content-Length", upstream.headers["Content-Length"])
+                    for name in ("Content-Range", "Accept-Ranges", "Content-Disposition", "Cache-Control", "Last-Modified", "ETag"):
+                        if upstream.headers.get(name):
+                            self.send_header(name, upstream.headers[name])
                     self.end_headers()
                     while True:
                         chunk = upstream.read(256 * 1024)
@@ -947,8 +974,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             workflow_name = str(payload.get("workflow") or "text_to_image").strip()
             prompt_text = str(payload.get("prompt") or "").strip()
-            if workflow_name not in {"text_to_image", "image_edit"}:
-                self.send_error_json(400, "workflow must be text_to_image or image_edit", "invalid_request")
+            allowed_workflows = {"text_to_image", "image_edit", "text_to_video", "image_to_video"}
+            if workflow_name not in allowed_workflows:
+                self.send_error_json(400, "unsupported ComfyUI workflow", "invalid_request")
                 return
             if not prompt_text:
                 self.send_error_json(400, "prompt is required", "invalid_request")
@@ -962,10 +990,10 @@ class Handler(BaseHTTPRequestHandler):
             comfyui_set_input(prompt_graph, mapping, "positive_prompt", prompt_text)
             comfyui_set_input(prompt_graph, mapping, "negative_prompt", str(payload.get("negative_prompt") or ""))
             uploaded_image_name = ""
-            if workflow_name == "image_edit":
+            if workflow_name in {"image_edit", "image_to_video"}:
                 image_payload = payload.get("image")
                 if not isinstance(image_payload, dict):
-                    self.send_error_json(400, "image is required for image_edit", "invalid_request")
+                    self.send_error_json(400, f"image is required for {workflow_name}", "invalid_request")
                     return
                 try:
                     image, filename = self.parse_image_payload(image_payload)
@@ -989,6 +1017,33 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_error_json(400, f"{field} must be between 1 and 8192", "invalid_request")
                         return
                     comfyui_set_input(prompt_graph, mapping, field, value)
+            if workflow_name in {"text_to_video", "image_to_video"}:
+                aspect_ratios = {
+                    "1:1 (Square)", "2:3 (Portrait Photo)", "3:2 (Photo)",
+                    "3:4 (Portrait Standard)", "4:3 (Standard)",
+                    "9:16 (Portrait Widescreen)", "16:9 (Widescreen)",
+                    "21:9 (Ultrawide)",
+                }
+                aspect_ratio = str(payload.get("aspect_ratio") or "").strip()
+                if aspect_ratio not in aspect_ratios:
+                    self.send_error_json(400, "invalid aspect_ratio", "invalid_request")
+                    return
+                try:
+                    megapixels = float(payload.get("megapixels"))
+                    duration = float(payload.get("duration"))
+                except (TypeError, ValueError):
+                    self.send_error_json(400, "megapixels and duration must be numbers", "invalid_request")
+                    return
+                allowed_megapixels = {0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.98, 1.0, 1.2, 1.5, 1.8, 2.0}
+                if megapixels not in allowed_megapixels:
+                    self.send_error_json(400, "invalid megapixels", "invalid_request")
+                    return
+                if duration < 5 or duration > 60:
+                    self.send_error_json(400, "duration must be between 5 and 60 seconds", "invalid_request")
+                    return
+                comfyui_set_input(prompt_graph, mapping, "aspect_ratio", aspect_ratio)
+                comfyui_set_input(prompt_graph, mapping, "megapixels", megapixels)
+                comfyui_set_input(prompt_graph, mapping, "duration", duration)
             request = {"prompt": prompt_graph, "client_id": str(CONFIG.get("comfyui_client_id") or "grok2api-comfyui")}
             trace(
                 "comfyui.prompt.resolved",
@@ -1000,6 +1055,9 @@ class Handler(BaseHTTPRequestHandler):
                     "width": payload.get("width"),
                     "height": payload.get("height"),
                     "input_image": uploaded_image_name,
+                    "aspect_ratio": payload.get("aspect_ratio"),
+                    "megapixels": payload.get("megapixels"),
+                    "duration": payload.get("duration"),
                 },
                 request=request,
             )
@@ -1013,10 +1071,12 @@ class Handler(BaseHTTPRequestHandler):
                 "workflow": workflow_name,
                 "prompt_id": str(result["prompt_id"]),
                 "comfyui_base_url": comfyui_base_url(),
-                "request": {"prompt": prompt_text, "negative_prompt": str(payload.get("negative_prompt") or ""), "width": payload.get("width"), "height": payload.get("height"), "input_image": uploaded_image_name},
+                "request": {"prompt": prompt_text, "negative_prompt": str(payload.get("negative_prompt") or ""), "width": payload.get("width"), "height": payload.get("height"), "input_image": uploaded_image_name, "aspect_ratio": payload.get("aspect_ratio"), "megapixels": payload.get("megapixels"), "duration": payload.get("duration")},
             }
-            model_name = "ComfyUI · 图片编辑" if workflow_name == "image_edit" else "ComfyUI · 文生图"
-            save_media("image", status="pending", prompt=prompt_text, model=model_name, metadata=metadata, media_id=task_id)
+            workflow_labels = {"text_to_image": "文生图", "image_edit": "图片编辑", "text_to_video": "文生视频", "image_to_video": "图生视频"}
+            model_name = "ComfyUI · " + workflow_labels[workflow_name]
+            media_kind = "video" if workflow_name in {"text_to_video", "image_to_video"} else "image"
+            save_media(media_kind, status="pending", prompt=prompt_text, model=model_name, metadata=metadata, media_id=task_id)
             self.send_json({"task_id": task_id, "prompt_id": str(result["prompt_id"]), "workflow": workflow_name, "status": "pending"})
             return
         if path == "/v1/media/uploads" or path == "/api/upload":

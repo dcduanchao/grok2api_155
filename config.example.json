@@ -12,7 +12,9 @@
   "comfyui_poll_timeout": 1800,
   "comfyui_workflows": {
     "text_to_image": "workflows/z_image_turbo_16.json",
-    "image_edit": "workflows/qwen_edit_all.json"
+    "image_edit": "workflows/qwen_edit_all.json",
+    "text_to_video": "workflows/video_minimax_h3_t2v.json",
+    "image_to_video": "workflows/video_minimax_h3_i2v.json"
   },
   "comfyui_workflow_mapping": {
     "text_to_image": {
@@ -25,6 +27,19 @@
       "positive_prompt": {"node_id": "18", "input": "prompt"},
       "negative_prompt": {"node_id": "5", "input": "text"},
       "input_image": {"node_id": "14", "input": "image"}
+    },
+    "text_to_video": {
+      "positive_prompt": {"node_id": "131", "input": "prompt"},
+      "aspect_ratio": {"node_id": "115", "input": "aspect_ratio"},
+      "megapixels": {"node_id": "115", "input": "megapixels"},
+      "duration": {"node_id": "133", "input": "value"}
+    },
+    "image_to_video": {
+      "positive_prompt": {"node_id": "133", "input": "prompt"},
+      "input_image": {"node_id": "114", "input": "image"},
+      "aspect_ratio": {"node_id": "115", "input": "aspect_ratio"},
+      "megapixels": {"node_id": "115", "input": "megapixels"},
+      "duration": {"node_id": "135", "input": "value"}
     }
   }
 }
