@@ -18,15 +18,13 @@
     "text_to_image": {
       "positive_prompt": {"node_id": "2", "input": "text"},
       "negative_prompt": {"node_id": "12", "input": "text"},
-      "seed": {"node_id": "17", "input": "seed"},
       "width": {"node_id": "14", "input": "width"},
       "height": {"node_id": "14", "input": "height"}
     },
     "image_edit": {
       "positive_prompt": {"node_id": "18", "input": "prompt"},
       "negative_prompt": {"node_id": "5", "input": "text"},
-      "input_image": {"node_id": "14", "input": "image"},
-      "seed": {"node_id": "19", "input": "seed"}
+      "input_image": {"node_id": "14", "input": "image"}
     }
   }
 }

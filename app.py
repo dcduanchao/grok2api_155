@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from http import HTTPStatus
+from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -53,7 +54,6 @@ def load_config() -> dict:
             "text_to_image": {
                 "positive_prompt": {"node_id": "2", "input": "text"},
                 "negative_prompt": {"node_id": "12", "input": "text"},
-                "seed": {"node_id": "17", "input": "seed"},
                 "width": {"node_id": "14", "input": "width"},
                 "height": {"node_id": "14", "input": "height"},
             },
@@ -61,7 +61,6 @@ def load_config() -> dict:
                 "positive_prompt": {"node_id": "18", "input": "prompt"},
                 "negative_prompt": {"node_id": "5", "input": "text"},
                 "input_image": {"node_id": "14", "input": "image"},
-                "seed": {"node_id": "19", "input": "seed"},
             },
         },
     }
@@ -349,6 +348,42 @@ def comfyui_request(method: str, path: str, payload: object | None = None) -> tu
     except (URLError, TimeoutError, OSError) as exc:
         result = comfyui_error(f"ComfyUI request failed: {exc}")
         trace("comfyui.response", method=method, url=target, status=502, result=result)
+        return 502, result
+
+
+def comfyui_restart() -> tuple[int, object]:
+    base = comfyui_base_url()
+    if not base:
+        return 503, comfyui_error("comfyui_base_url is not configured in config.json", "configuration_error")
+    target = urljoin(base + "/", "manager/reboot")
+    trace("comfyui.restart.request", method="POST", url=target, params={})
+    try:
+        with urlopen(
+            Request(target, headers={"Accept": "application/json, text/plain, */*"}, method="POST"),
+            timeout=float(CONFIG.get("comfyui_request_timeout", 30)),
+        ) as response:
+            raw = response.read()
+            result = {"ok": True, "message": "ComfyUI restart requested"}
+            if raw:
+                try:
+                    result["result"] = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError:
+                    result["result"] = raw.decode("utf-8", "replace")
+            trace("comfyui.restart.response", method="POST", url=target, status=response.status, result=result)
+            return response.status, result
+    except HTTPError as exc:
+        raw = exc.read()
+        message = raw.decode("utf-8", "replace").strip() or str(exc)
+        result = comfyui_error(f"ComfyUI restart failed: {message}")
+        trace("comfyui.restart.response", method="POST", url=target, status=exc.code, result=result)
+        return exc.code, result
+    except (RemoteDisconnected, ConnectionResetError, BrokenPipeError) as exc:
+        result = {"ok": True, "message": "ComfyUI restart requested; connection closed during restart"}
+        trace("comfyui.restart.response", method="POST", url=target, status=202, result={**result, "connection": str(exc)})
+        return 202, result
+    except (URLError, TimeoutError, OSError) as exc:
+        result = comfyui_error(f"ComfyUI restart failed: {exc}")
+        trace("comfyui.restart.response", method="POST", url=target, status=502, result=result)
         return 502, result
 
 
@@ -730,6 +765,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/v1/") and not self.authorized():
             self.send_error_json(401, "invalid API key", "authentication_error")
             return
+        if path == "/api/comfyui/restart":
+            status, result = comfyui_restart()
+            self.send_json(result, status)
+            return
         if path == "/api/comfyui/generations":
             try:
                 payload = self.read_json()
@@ -769,13 +808,6 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 uploaded_image_name = str(upload_result.get("name") or upload_result.get("filename") or filename)
                 comfyui_set_input(prompt_graph, mapping, "input_image", uploaded_image_name)
-            if payload.get("seed") is not None:
-                try:
-                    seed = int(payload["seed"])
-                except (TypeError, ValueError):
-                    self.send_error_json(400, "seed must be an integer", "invalid_request")
-                    return
-                comfyui_set_input(prompt_graph, mapping, "seed", seed)
             for field in ("width", "height"):
                 if payload.get(field) is not None:
                     try:
@@ -795,7 +827,6 @@ class Handler(BaseHTTPRequestHandler):
                 replacements={
                     "positive_prompt": prompt_text,
                     "negative_prompt": str(payload.get("negative_prompt") or ""),
-                    "seed": payload.get("seed"),
                     "width": payload.get("width"),
                     "height": payload.get("height"),
                     "input_image": uploaded_image_name,
@@ -812,7 +843,7 @@ class Handler(BaseHTTPRequestHandler):
                 "workflow": workflow_name,
                 "prompt_id": str(result["prompt_id"]),
                 "comfyui_base_url": comfyui_base_url(),
-                "request": {"prompt": prompt_text, "negative_prompt": str(payload.get("negative_prompt") or ""), "seed": payload.get("seed"), "width": payload.get("width"), "height": payload.get("height"), "input_image": uploaded_image_name},
+                "request": {"prompt": prompt_text, "negative_prompt": str(payload.get("negative_prompt") or ""), "width": payload.get("width"), "height": payload.get("height"), "input_image": uploaded_image_name},
             }
             model_name = "ComfyUI · 图片编辑" if workflow_name == "image_edit" else "ComfyUI · 文生图"
             save_media("image", status="pending", prompt=prompt_text, model=model_name, metadata=metadata, media_id=task_id)
