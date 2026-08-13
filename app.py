@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import base64
 import copy
+import hmac
 import io
 import json
 import mimetypes
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
 import uuid
+from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,8 +32,11 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.getenv("GROK2API_CONFIG", ROOT / "config.json"))
 DB_PATH = Path(os.getenv("GROK2API_DB", ROOT / "data" / "media.db"))
 INDEX_PATH = ROOT / "index.html"
+LOGIN_PATH = ROOT / "login.html"
 LOG_PATH = Path(os.getenv("GROK2API_LOG", ROOT / "grok2api.log"))
 DB_LOCK = threading.Lock()
+SESSION_LOCK = threading.Lock()
+SESSIONS: dict[str, float] = {}
 
 
 def load_config() -> dict:
@@ -38,6 +44,8 @@ def load_config() -> dict:
         "host": "127.0.0.1",
         "port": 8000,
         "api_key": "",
+        "access_password": "",
+        "session_hours": 12,
         "upstream_base_url": "",
         "upstream_api_key": "",
         "imgbb_api_key": "",
@@ -90,6 +98,7 @@ def load_config() -> dict:
     # documented config-file workflow.
     for key, env_name in {
         "api_key": "GROK2API_API_KEY",
+        "access_password": "GROK2API_ACCESS_PASSWORD",
         "upstream_base_url": "GROK2API_UPSTREAM_URL",
         "upstream_api_key": "GROK2API_UPSTREAM_KEY",
         "imgbb_api_key": "IMGBB_API_KEY",
@@ -632,6 +641,7 @@ def comfyui_outputs(history: object, prompt_id: str) -> list[dict]:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "GrokMedia/1.0"
+    session_cookie = "grok2api_session"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
@@ -649,11 +659,59 @@ class Handler(BaseHTTPRequestHandler):
     def send_error_json(self, status: int, message: str, error_type: str = "invalid_request") -> None:
         self.send_json({"error": {"message": message, "type": error_type}}, status)
 
-    def authorized(self) -> bool:
-        expected = str(CONFIG.get("api_key", ""))
-        if not expected:
+    def session_token(self) -> str:
+        try:
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+            return cookie[self.session_cookie].value if self.session_cookie in cookie else ""
+        except Exception:
+            return ""
+
+    def session_authorized(self) -> bool:
+        token = self.session_token()
+        if not token:
+            return False
+        now = time.time()
+        with SESSION_LOCK:
+            expires = SESSIONS.get(token, 0)
+            if expires <= now:
+                SESSIONS.pop(token, None)
+                return False
             return True
-        return self.headers.get("Authorization", "") == "Bearer " + expected
+
+    def authorized(self) -> bool:
+        if self.session_authorized():
+            return True
+        authorization = self.headers.get("Authorization", "")
+        if not authorization.startswith("Bearer "):
+            return False
+        supplied = authorization[7:]
+        expected_values = [str(CONFIG.get(name) or "") for name in ("api_key", "access_password")]
+        return any(expected and hmac.compare_digest(supplied, expected) for expected in expected_values)
+
+    def access_configured(self) -> bool:
+        return bool(str(CONFIG.get("access_password") or CONFIG.get("api_key") or ""))
+
+    def login_password_valid(self, password: str) -> bool:
+        expected = str(CONFIG.get("access_password") or CONFIG.get("api_key") or "")
+        return bool(expected) and hmac.compare_digest(password, expected)
+
+    def send_login_page(self) -> None:
+        body = LOGIN_PATH.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def require_auth(self, path: str) -> bool:
+        if self.authorized():
+            return True
+        if self.command == "GET" and path in {"/", "/index.html"}:
+            self.send_login_page()
+        else:
+            self.send_error_json(401, "authentication required", "authentication_error")
+        return False
 
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -676,6 +734,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/api/auth/session":
+            self.send_json({"authenticated": self.authorized(), "configured": self.access_configured()}, 200 if self.authorized() else 401)
+            return
+        if not self.require_auth(path):
+            return
         if path == "/" or path == "/index.html":
             body = INDEX_PATH.read_bytes()
             self.send_response(200)
@@ -884,8 +947,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         trace("request", method="DELETE", url=self.path, params={})
-        if path.startswith("/v1/") and not self.authorized():
-            self.send_error_json(401, "invalid API key", "authentication_error")
+        if not self.require_auth(path):
             return
         if path in {"/api/history", "/v1/media/history"}:
             kind = parse_qs(parsed.query).get("kind", [None])[0]
@@ -911,8 +973,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path.startswith("/v1/") and not self.authorized():
-            self.send_error_json(401, "invalid API key", "authentication_error")
+        if path == "/api/auth/login":
+            try:
+                payload = self.read_json()
+            except (ValueError, json.JSONDecodeError):
+                self.send_error_json(400, "invalid login request", "invalid_request")
+                return
+            if not self.login_password_valid(str(payload.get("password") or "")):
+                self.send_error_json(401, "访问密码错误", "authentication_error")
+                return
+            token = secrets.token_urlsafe(32)
+            max_age = max(300, int(float(CONFIG.get("session_hours", 12)) * 3600))
+            with SESSION_LOCK:
+                now = time.time()
+                expired = [key for key, expires in SESSIONS.items() if expires <= now]
+                for key in expired:
+                    SESSIONS.pop(key, None)
+                SESSIONS[token] = now + max_age
+            self.send_response(200)
+            body = json_bytes({"ok": True})
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", f"{self.session_cookie}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/api/auth/logout":
+            token = self.session_token()
+            with SESSION_LOCK:
+                SESSIONS.pop(token, None)
+            body = json_bytes({"ok": True})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", f"{self.session_cookie}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if not self.require_auth(path):
             return
         if path == "/api/comfyui/restart":
             status, result = comfyui_restart()
