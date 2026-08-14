@@ -21,6 +21,9 @@
 - `GET /v1/media/history`（或 `/api/history`）：查询本地素材历史，支持 `kind=image|video|upload` 和 `limit`。
 - `DELETE /api/history/{id}`：删除一条本地记录；`POST /api/history/delete` 搭配 `{ "ids": ["..."] }` 批量删除。
 - `DELETE /api/history?kind=image|video|upload`：按素材类型清空历史；不传 `kind` 清空全部历史。
+- `GET /api/prompt-favorites?kind=image|video`：按生图或视频分类读取提示词收藏。
+- `POST /api/prompt-favorites`：新增或修改提示词收藏，参数包含 `id`（修改时）、`kind`、`name` 和 `prompt`。
+- `DELETE /api/prompt-favorites/{id}`：删除一条提示词收藏。
 
 当上游或 ImgBB 未配置时，接口会返回带有 `configuration_error` 类型的 JSON 错误，而不是伪造生成结果。
 

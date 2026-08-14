@@ -53,6 +53,18 @@ def load_config() -> dict:
         "comfyui_client_id": "grok2api-comfyui",
         "comfyui_request_timeout": 30,
         "comfyui_poll_timeout": 1800,
+        "prompt_expansion_system_prompts": {
+            "image": {
+                "expand": "你是专业的 AI 生图提示词优化助手。保留用户原始意图，将提示词扩展为具体、连贯、可直接用于图像生成的中文提示词。补充主体、场景、构图、光线、色彩、材质和画面质量等细节。只输出扩展后的提示词，不要解释，不要使用 Markdown。",
+                "nsfw": "你是专业的 AI 生图提示词优化助手。将用户提示词扩展为更具表现力的成人向图像生成提示词，仅允许明确为成年人的合法内容。保留用户原始意图，补充主体、场景、构图、光线、色彩、材质和画面质量。只输出扩展后的提示词，不要解释，不要使用 Markdown。",
+                "reference_image_context": "当前任务包含参考图片。扩展时应将参考图作为视觉基础，重点描述需要保留的主体、构图或风格，以及希望修改或新增的内容；不要编造用户文字中无法确定的参考图细节。",
+            },
+            "comfyui_video": {
+                "expand": "你是专业的 AI 视频提示词优化助手。保留用户原始意图，将提示词扩展为适合文生视频或图生视频的中文提示词。清晰描述主体动作、镜头运动、场景变化、光线、节奏和时间连续性。只输出扩展后的提示词，不要解释，不要使用 Markdown。",
+                "nsfw": "你是专业的 AI 视频提示词优化助手。将用户提示词扩展为更具表现力的成人向视频生成提示词，仅允许明确为成年人的合法内容。补充主体动作、镜头运动、场景变化、光线、节奏和时间连续性。只输出扩展后的提示词，不要解释，不要使用 Markdown。",
+                "reference_image_context": "当前任务包含首帧或参考图片。扩展时应以参考图为起始视觉基础，保持主体身份和外观连续，重点描述后续动作、镜头运动和场景变化；不要重新虚构首帧内容。",
+            },
+        },
         "comfyui_workflows": {
             "text_to_image": "workflows/z_image_turbo_16.json",
             "image_edit": "workflows/qwen_edit_all.json",
@@ -151,6 +163,13 @@ def init_db() -> None:
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL,
                 api_key TEXT NOT NULL DEFAULT '', models TEXT NOT NULL DEFAULT '[]',
                 enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS prompt_favorites (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                prompt TEXT NOT NULL, created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )"""
         )
@@ -315,6 +334,82 @@ def delete_image_provider(provider_id: str) -> bool:
         return cursor.rowcount > 0
 
 
+def provider_for_model_discovery(payload: dict) -> dict:
+    provider_id = str(payload.get("provider_id") or "").strip()
+    existing = get_image_provider(provider_id) if provider_id else None
+    base_url = str(payload.get("base_url") or (existing or {}).get("base_url") or "").strip().rstrip("/")
+    if base_url.lower().endswith("/v1"):
+        base_url = base_url[:-3].rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must be an http or https URL")
+    supplied_key = str(payload.get("api_key") or "").strip()
+    api_key = supplied_key or str((existing or {}).get("api_key") or "").strip()
+    return {
+        "id": provider_id,
+        "name": str(payload.get("name") or (existing or {}).get("name") or "model discovery").strip(),
+        "base_url": base_url,
+        "api_key": api_key,
+        "enabled": True,
+    }
+
+
+def list_prompt_favorites(kind: str | None = None) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        if kind in {"image", "video"}:
+            rows = db.execute(
+                "SELECT * FROM prompt_favorites WHERE kind=? ORDER BY updated_at DESC",
+                (kind,),
+            ).fetchall()
+        else:
+            rows = db.execute("SELECT * FROM prompt_favorites ORDER BY updated_at DESC").fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_prompt_favorite(payload: dict) -> dict:
+    favorite_id = str(payload.get("id") or uuid.uuid4().hex).strip()
+    kind = str(payload.get("kind") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    prompt = str(payload.get("prompt") or "").strip()
+    if kind not in {"image", "video"}:
+        raise ValueError("kind must be image or video")
+    if not prompt:
+        raise ValueError("prompt is required")
+    if len(prompt) > 20000:
+        raise ValueError("prompt must be 20000 characters or fewer")
+    if not name:
+        name = prompt.replace("\r", " ").replace("\n", " ")[:40]
+    if len(name) > 100:
+        raise ValueError("name must be 100 characters or fewer")
+    now = int(time.time())
+    with DB_LOCK, sqlite3.connect(DB_PATH) as db:
+        existing = db.execute(
+            "SELECT created_at FROM prompt_favorites WHERE id=?", (favorite_id,)
+        ).fetchone()
+        created_at = existing[0] if existing else now
+        db.execute(
+            "INSERT OR REPLACE INTO prompt_favorites(id,kind,name,prompt,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (favorite_id, kind, name, prompt, created_at, now),
+        )
+        db.commit()
+    return {
+        "id": favorite_id,
+        "kind": kind,
+        "name": name,
+        "prompt": prompt,
+        "created_at": created_at,
+        "updated_at": now,
+    }
+
+
+def delete_prompt_favorite(favorite_id: str) -> bool:
+    with DB_LOCK, sqlite3.connect(DB_PATH) as db:
+        cursor = db.execute("DELETE FROM prompt_favorites WHERE id=?", (favorite_id,))
+        db.commit()
+        return cursor.rowcount > 0
+
+
 def json_bytes(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False).encode("utf-8")
 
@@ -425,6 +520,73 @@ def image_provider_request(provider: dict, path: str, payload: dict, image: byte
         result = {"error": {"message": f"image provider request failed: {exc}", "type": "upstream_error"}}
         trace("image_provider.response", method="POST", url=target, provider=provider.get("name"), status=502, result=result)
         return 502, result
+
+
+def provider_json_request(provider: dict, method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+    base = str(provider.get("base_url") or "").rstrip("/")
+    target = urljoin(base + "/", path.lstrip("/"))
+    headers = {"Accept": "application/json"}
+    key = str(provider.get("api_key") or "").strip()
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    body = None
+    if payload is not None:
+        body = json_bytes(payload)
+        headers["Content-Type"] = "application/json"
+    trace("provider.request", method=method, url=target, provider=provider.get("name"), params=payload or {})
+    try:
+        with urlopen(Request(target, data=body, headers=headers, method=method), timeout=float(CONFIG.get("request_timeout", 120))) as response:
+            raw = response.read()
+            try:
+                result = json.loads(raw.decode("utf-8")) if raw else {}
+            except json.JSONDecodeError:
+                result = {"raw": raw.decode("utf-8", "replace")}
+            result = result if isinstance(result, dict) else {"data": result}
+            trace("provider.response", method=method, url=target, provider=provider.get("name"), status=response.status, result=result)
+            return response.status, result
+    except HTTPError as exc:
+        raw = exc.read()
+        try:
+            result = json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError:
+            result = {"error": {"message": raw.decode("utf-8", "replace") or str(exc)}}
+        trace("provider.response", method=method, url=target, provider=provider.get("name"), status=exc.code, result=result)
+        return exc.code, result
+    except (URLError, TimeoutError, OSError) as exc:
+        result = {"error": {"message": f"provider request failed: {exc}", "type": "upstream_error"}}
+        trace("provider.response", method=method, url=target, provider=provider.get("name"), status=502, result=result)
+        return 502, result
+
+
+def prompt_expansion_system_prompt(scene: str, preset: str, has_reference_image: bool = False) -> str:
+    prompts = CONFIG.get("prompt_expansion_system_prompts") or {}
+    scene_prompts = prompts.get(scene) if isinstance(prompts, dict) else None
+    value = scene_prompts.get(preset) if isinstance(scene_prompts, dict) else None
+    system_prompt = str(value or "").strip()
+    if has_reference_image and isinstance(scene_prompts, dict):
+        reference_context = str(scene_prompts.get("reference_image_context") or "").strip()
+        if reference_context:
+            system_prompt = (system_prompt + "\n\n" + reference_context).strip()
+    return system_prompt
+
+
+def extract_chat_content(result: dict) -> str:
+    choices = result.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts).strip()
+    return ""
 
 
 def persist_generation(response: dict, kind: str, payload: dict, request_id: str | None = None) -> None:
@@ -722,7 +884,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
 
     def do_GET(self):
@@ -757,6 +919,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/images/providers":
             providers = list_image_providers()
             self.send_json({"data": providers})
+            return
+        if path == "/api/prompt-favorites":
+            kind = parse_qs(parsed.query).get("kind", [None])[0]
+            if kind not in {None, "image", "video"}:
+                self.send_error_json(400, "kind must be image or video", "invalid_request")
+                return
+            self.send_json({"data": list_prompt_favorites(kind)})
             return
         if path == "/api/comfyui/workflows":
             workflows = CONFIG.get("comfyui_workflows") or {}
@@ -963,6 +1132,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json({"deleted": [media_id]})
             return
+        favorite_prefix = "/api/prompt-favorites/"
+        if path.startswith(favorite_prefix):
+            favorite_id = path[len(favorite_prefix):]
+            if not favorite_id or "/" in favorite_id:
+                self.send_error_json(400, "favorite id is required", "invalid_request")
+                return
+            if not delete_prompt_favorite(favorite_id):
+                self.send_error_json(404, "prompt favorite not found", "not_found")
+                return
+            self.send_json({"deleted": favorite_id})
+            return
         self.send_error_json(404, "not found", "not_found")
 
     def do_POST(self):
@@ -1019,12 +1199,86 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(provider)
             return
+        if path == "/api/prompt-favorites":
+            try:
+                favorite = save_prompt_favorite(self.read_json())
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_error_json(400, str(exc), "invalid_request")
+                return
+            self.send_json(favorite)
+            return
         if path.startswith("/api/images/providers/") and path.count("/") == 4:
             provider_id = path.rsplit("/", 1)[-1]
             if not delete_image_provider(provider_id):
                 self.send_error_json(404, "image provider not found", "not_found")
                 return
             self.send_json({"deleted": provider_id})
+            return
+        if path == "/api/prompt-expansion/models":
+            try:
+                payload = self.read_json()
+                provider = provider_for_model_discovery(payload)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_error_json(400, str(exc), "invalid_request")
+                return
+            status, result = provider_json_request(provider, "GET", "/v1/models")
+            if status >= 400:
+                self.send_json(result, status)
+                return
+            data = result.get("data") if isinstance(result, dict) else None
+            models = []
+            if isinstance(data, list):
+                for item in data:
+                    model_id = item.get("id") if isinstance(item, dict) else item
+                    if str(model_id or "").strip():
+                        models.append(str(model_id).strip())
+            self.send_json({"data": sorted(set(models), key=str.lower)})
+            return
+        if path == "/api/prompt-expansion":
+            try:
+                payload = self.read_json()
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_error_json(400, str(exc), "invalid_request")
+                return
+            provider = get_image_provider(str(payload.get("provider_id") or "").strip())
+            if not provider or not provider.get("enabled"):
+                self.send_error_json(400, "enabled provider is required", "invalid_request")
+                return
+            model = str(payload.get("model") or "").strip()
+            prompt = str(payload.get("prompt") or "").strip()
+            scene = str(payload.get("scene") or "image").strip()
+            preset = str(payload.get("preset") or "expand").strip()
+            has_reference_image = payload.get("has_reference_image") is True
+            if not model or not prompt:
+                self.send_error_json(400, "model and prompt are required", "invalid_request")
+                return
+            if model not in (provider.get("models") or []):
+                self.send_error_json(400, "model is not saved for this provider", "invalid_request")
+                return
+            if scene not in {"image", "comfyui_video"} or preset not in {"expand", "nsfw"}:
+                self.send_error_json(400, "invalid prompt expansion scene or preset", "invalid_request")
+                return
+            system_prompt = prompt_expansion_system_prompt(scene, preset, has_reference_image)
+            if not system_prompt:
+                self.send_error_json(503, "prompt expansion system prompt is not configured", "configuration_error")
+                return
+            request_payload = {
+                "model": model,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            }
+            status, result = provider_json_request(provider, "POST", "/v1/chat/completions", request_payload)
+            if status >= 400:
+                self.send_json(result, status)
+                return
+            expanded = extract_chat_content(result)
+            if not expanded:
+                self.send_error_json(502, "provider returned no message content", "upstream_error")
+                return
+            self.send_json({"prompt": expanded, "model": model, "scene": scene, "preset": preset})
             return
         if path in {"/api/images/generations", "/api/images/edits"}:
             try:
